@@ -1,0 +1,95 @@
+package storage
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	keeperv1 "github.com/Dev03271998/keeper/api/v1alpha1"
+)
+
+// Secret keys read from StorageSpec.CredentialsSecretRef.
+const (
+	SecretAccessKeyID     = "accessKeyID"
+	SecretSecretAccessKey = "secretAccessKey"
+)
+
+// Factory opens the ObjectStore a StorageSpec points at.
+type Factory interface {
+	Open(ctx context.Context, namespace string, spec keeperv1.StorageSpec) (ObjectStore, error)
+}
+
+// SecretFactory builds S3 stores using credentials from a Secret in the
+// object's namespace.
+type SecretFactory struct {
+	Client client.Reader
+}
+
+func readCredentials(ctx context.Context, c client.Reader, namespace string, spec keeperv1.StorageSpec) (id, secret string, err error) {
+	var sec corev1.Secret
+	key := types.NamespacedName{Namespace: namespace, Name: spec.CredentialsSecretRef.Name}
+	if err := c.Get(ctx, key, &sec); err != nil {
+		return "", "", fmt.Errorf("storage credentials secret %s: %w", key, err)
+	}
+	id, secret = string(sec.Data[SecretAccessKeyID]), string(sec.Data[SecretSecretAccessKey])
+	if id == "" || secret == "" {
+		return "", "", fmt.Errorf("storage credentials secret %s must contain %s and %s", key, SecretAccessKeyID, SecretSecretAccessKey)
+	}
+	return id, secret, nil
+}
+
+// Open implements Factory.
+func (f SecretFactory) Open(ctx context.Context, namespace string, spec keeperv1.StorageSpec) (ObjectStore, error) {
+	id, secret, err := readCredentials(ctx, f.Client, namespace, spec)
+	if err != nil {
+		return nil, err
+	}
+	return NewS3(S3Config{
+		Endpoint:        spec.Endpoint,
+		Bucket:          spec.Bucket,
+		Region:          spec.Region,
+		AccessKeyID:     id,
+		SecretAccessKey: secret,
+	})
+}
+
+// MemoryFactory hands out one Memory store per endpoint+bucket. It is used by
+// tests and the offline demo.
+type MemoryFactory struct {
+	// Secrets, when set, makes Open validate the credentials Secret exactly
+	// like SecretFactory does, so missing Secrets fail the same way.
+	Secrets client.Reader
+
+	mu     sync.Mutex
+	stores map[string]*Memory
+}
+
+// NewMemoryFactory returns an empty MemoryFactory.
+func NewMemoryFactory() *MemoryFactory { return &MemoryFactory{stores: map[string]*Memory{}} }
+
+// Open implements Factory.
+func (f *MemoryFactory) Open(ctx context.Context, namespace string, spec keeperv1.StorageSpec) (ObjectStore, error) {
+	if f.Secrets != nil {
+		if _, _, err := readCredentials(ctx, f.Secrets, namespace, spec); err != nil {
+			return nil, err
+		}
+	}
+	return f.Store(spec.Endpoint, spec.Bucket), nil
+}
+
+// Store returns (creating if needed) the store for endpoint and bucket.
+func (f *MemoryFactory) Store(endpoint, bucket string) *Memory {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := endpoint + "|" + bucket
+	m, ok := f.stores[k]
+	if !ok {
+		m = NewMemory()
+		f.stores[k] = m
+	}
+	return m
+}
